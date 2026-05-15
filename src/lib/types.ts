@@ -2,6 +2,9 @@ export type Severity = "medium" | "low";
 
 export type Verdict = "clean" | "warning" | "infected";
 
+/** Aggregate strength of heuristic signals — use with verdict (not malware proof). */
+export type DetectionConfidence = "low" | "medium" | "high" | "very_high";
+
 export type FindingCategory =
   | "hidden_links"
   | "cloaked_links"
@@ -37,6 +40,7 @@ export interface ScanResult {
   scannedAt: string;
   fetchMs: number;
   verdict: Verdict;
+  detectionConfidence: DetectionConfidence;
   score: number;
   summary: ScanSummary;
   findings: ScanFinding[];

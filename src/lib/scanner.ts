@@ -1,5 +1,6 @@
 import * as cheerio from "cheerio";
 import type {
+  DetectionConfidence,
   ScanFinding,
   ScanResult,
   ScanSummary,
@@ -23,6 +24,52 @@ const GAMBLING_SEO_SPAM_HIGH_CONFIDENCE = [
   "deneme bonusu veren siteler",
 ];
 
+/**
+ * Common in Asian gambling SEO parasites; only match when the link is **off-site**
+ * (injected links on unrelated victim domains).
+ */
+const GAMBLING_SEO_SPAM_OFFSITE_ONLY = [
+  "link alternatif",
+  "situs slot",
+  "slot gacor",
+  "rtp slot",
+  "bonus new member",
+  "deposit pulsa",
+  "situs judi",
+  "judi slot",
+  "agen slot",
+  "daftar slot",
+  "rtp live",
+  "live casino online",
+  "slot maxwin",
+  "maxwin slot",
+  "mahjong ways",
+  "mahjong way",
+  "sweet bonanza",
+  "starlight princess",
+  "zeus slot",
+  "olympus slot",
+  "pragmatic play demo",
+  "gates of olympus",
+];
+
+/** Pharma / pills spam often injected as parasite links — off-site only. */
+const PHARMA_PARASITE_LINK_OFFSITE = [
+  "cheap viagra",
+  "buy viagra",
+  "buy cialis",
+  "cialis online",
+  "viagra online",
+  "xanax for sale",
+  "tramadol online",
+  "hydrocodone online",
+  "buy ambien online",
+  "generic levitra",
+  "kamagra",
+  "propecia online",
+  "no prescription needed",
+];
+
 /** Shorter tokens: only count if link is off-site or hidden (reduces random word hits). */
 const GAMBLING_SEO_SPAM_CONTEXT_ONLY = ["gamdom"];
 
@@ -30,15 +77,26 @@ function normalizeAnchorText(t: string): string {
   return t.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
-function gamblingSeoSpamAnchorLevel(
-  text: string,
+function parasiteAnchorPhraseLevel(
+  textJoined: string,
   ctx: { offSite: boolean; visuallyHidden: boolean },
 ): "high" | "context" | null {
-  const n = normalizeAnchorText(text);
+  const n = normalizeAnchorText(textJoined);
   if (!n) return null;
+
   for (const p of GAMBLING_SEO_SPAM_HIGH_CONFIDENCE) {
     if (n.includes(p)) return "high";
   }
+
+  if (ctx.offSite) {
+    for (const p of PHARMA_PARASITE_LINK_OFFSITE) {
+      if (n.includes(p)) return "high";
+    }
+    for (const p of GAMBLING_SEO_SPAM_OFFSITE_ONLY) {
+      if (n.includes(p)) return "high";
+    }
+  }
+
   if (ctx.offSite || ctx.visuallyHidden) {
     for (const p of GAMBLING_SEO_SPAM_CONTEXT_ONLY) {
       if (n.includes(p)) return "context";
@@ -192,22 +250,57 @@ function finalizeFindings(rows: InternalRow[]): ScanFinding[] {
 function scoreFromFindings(findings: ScanFinding[]): {
   verdict: Verdict;
   score: number;
+  detectionConfidence: DetectionConfidence;
 } {
-  let penalty = 0;
-  let serious = 0;
+  /** Cap so dozens of identical spam links do not pin the UI at 0/100 (misread as “no detection”). */
+  const MAX_SAFETY_PENALTY = 68;
+
+  const groups = new Map<string, ScanFinding[]>();
   for (const f of findings) {
-    if (f.severity === "medium") {
-      penalty += 22;
-      serious += 1;
-    } else {
-      penalty += 6;
+    const k = `${f.category}\0${f.title}`;
+    const arr = groups.get(k) ?? [];
+    arr.push(f);
+    groups.set(k, arr);
+  }
+
+  let penalty = 0;
+  let totalMedium = 0;
+  for (const arr of groups.values()) {
+    const med = arr.filter((x) => x.severity === "medium").length;
+    const low = arr.filter((x) => x.severity === "low").length;
+    totalMedium += med;
+    if (med > 0) {
+      penalty += 20;
+      penalty += Math.min(med - 1, 14) * 3;
+    }
+    if (low > 0) {
+      penalty += 5;
+      penalty += Math.min(low - 1, 15) * 2;
     }
   }
-  const score = Math.max(0, 100 - Math.min(100, penalty));
+
+  penalty = Math.min(MAX_SAFETY_PENALTY, penalty);
+  const score = Math.max(0, 100 - penalty);
+
   let verdict: Verdict = "clean";
-  if (serious >= 2 || score < 40) verdict = "infected";
-  else if (findings.length > 0 || score < 78) verdict = "warning";
-  return { verdict, score };
+  if (totalMedium >= 2 || score < 42) verdict = "infected";
+  else if (findings.length > 0 || score < 80) verdict = "warning";
+
+  const malwareCount = findings.filter((f) => f.category === "malware_patterns").length;
+  const hiddenCount = findings.filter((f) => f.category === "hidden_links").length;
+
+  let detectionConfidence: DetectionConfidence = "low";
+  if (verdict === "infected") {
+    if (malwareCount >= 10 || findings.length >= 18 || (malwareCount >= 6 && hiddenCount >= 4)) {
+      detectionConfidence = "very_high";
+    } else {
+      detectionConfidence = "high";
+    }
+  } else if (verdict === "warning") {
+    detectionConfidence = findings.length >= 6 ? "high" : "medium";
+  }
+
+  return { verdict, score, detectionConfidence };
 }
 
 function summarize(findings: ScanFinding[]): ScanSummary {
@@ -316,6 +409,9 @@ export function analyzeHtml(
     const href = $a.attr("href") || "";
     const text = $a.text().replace(/\s+/g, " ").trim();
 
+    const titleAttr = ($a.attr("title") || "").replace(/\s+/g, " ").trim();
+    const linkLabel = [text, titleAttr].filter(Boolean).join(" ");
+
     const { hidden } = collectAncestorStyles($, el);
     const selfStyles = parseStyle($a.attr("style"));
     const selfHidden = isHiddenByStyles(selfStyles) || hidden;
@@ -388,24 +484,20 @@ export function analyzeHtml(
       }
     }
 
-    if (SPAM_KEYWORD_RE.test(`${text} ${href}`) && (selfHidden || ariaHidden)) {
+    if (SPAM_KEYWORD_RE.test(`${linkLabel} ${href}`) && (selfHidden || ariaHidden)) {
       rows.push({
         category: "malware_patterns",
         internal: "high",
         title: "Spam keywords in hidden context",
         description: "Hidden or aria-hidden link/URL matches spam/pharma-style vocabulary.",
         remediation: "Treat as compromise indicator — scan filesystem & DB, rotate creds.",
-        evidence: truncate(`${text} | ${href}`),
+        evidence: truncate(`${linkLabel} | ${href}`),
       });
     }
 
-    const offSite = !!(
-      h &&
-      h !== pageH &&
-      !h.endsWith(`.${pageH}`)
-    );
+    const offSite = !!(h && h !== pageH && !h.endsWith(`.${pageH}`));
     const visuallyHidden = selfHidden || ariaHidden || hidden;
-    const spamLevel = gamblingSeoSpamAnchorLevel(text, {
+    const spamLevel = parasiteAnchorPhraseLevel(linkLabel, {
       offSite,
       visuallyHidden,
     });
@@ -413,12 +505,12 @@ export function analyzeHtml(
       rows.push({
         category: "malware_patterns",
         internal: spamLevel === "high" ? "high" : "medium",
-        title: "Gambling / SEO spam injection (link text)",
+        title: "Parasite spam (anchor / title text)",
         description:
-          "Anchor text matches phrases commonly injected in hacked footers and parasite pages (often paired with unrelated destinations).",
+          "Visible or hidden link label/title matches phrases common in hacked footer injections (gambling SEO, pill spam, or similar). Destination is often an unrelated third-party site.",
         remediation:
           "Search theme, plugins, database options, and server files for this HTML; rotate CMS credentials; review recent admin logins.",
-        evidence: truncate(`text="${text}" href=${href} ${$.html(el)}`),
+        evidence: truncate(`label="${linkLabel}" href=${href} ${$.html(el)}`),
       });
     }
   });
@@ -555,7 +647,7 @@ export function analyzeHtml(
   }
 
   const findings = finalizeFindings(rows);
-  const { verdict, score } = scoreFromFindings(findings);
+  const { verdict, score, detectionConfidence } = scoreFromFindings(findings);
   const summary = summarize(findings);
 
   const snippet = truncate($.root().html() || "", 8000);
@@ -566,6 +658,7 @@ export function analyzeHtml(
     scannedAt: new Date().toISOString(),
     fetchMs: fetchMeta.fetchMs,
     verdict,
+    detectionConfidence,
     score,
     summary,
     findings,

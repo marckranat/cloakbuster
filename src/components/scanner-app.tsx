@@ -1,7 +1,12 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { ScanFinding, ScanResult, Verdict } from "@/lib/types";
+import type {
+  ScanFinding,
+  ScanResult,
+  Verdict,
+  DetectionConfidence,
+} from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -15,6 +20,49 @@ import {
   ShieldCheck,
   Skull,
 } from "lucide-react";
+
+const CONFIDENCE_LABEL: Record<DetectionConfidence, string> = {
+  low: "Low",
+  medium: "Moderate",
+  high: "High",
+  very_high: "Very high",
+};
+
+/** 100 = best (cleaner), 0 = worst (more flags). */
+function safetyScoreTier(score: number): {
+  label: string;
+  hint: string;
+  badgeClassName: string;
+} {
+  if (score >= 85) {
+    return {
+      label: "Excellent",
+      hint: "No or minimal concern under these rules.",
+      badgeClassName: "border-verdict-clean/50 bg-verdict-clean/15 text-verdict-clean",
+    };
+  }
+  if (score >= 65) {
+    return {
+      label: "Good",
+      hint: "Mostly fine — still skim the findings.",
+      badgeClassName: "border-emerald-500/40 bg-emerald-500/10 text-emerald-200",
+    };
+  }
+  if (score >= 40) {
+    return {
+      label: "Fair",
+      hint: "Notable issues — investigate.",
+      badgeClassName:
+        "border-verdict-warning/45 bg-verdict-warning/15 text-verdict-warning",
+    };
+  }
+  return {
+    label: "Poor",
+    hint: "Many signals — assume risk until ruled out.",
+    badgeClassName:
+      "border-verdict-infected/45 bg-verdict-infected/15 text-verdict-infected",
+  };
+}
 
 const HISTORY_KEY = "cloakbuster-scan-history";
 const LEGACY_HISTORY_KEY = "parasite-unmasker-history";
@@ -154,6 +202,7 @@ export function ScannerApp() {
 
   const verdict = result ? verdictCopy[result.verdict] : null;
   const VerdictIcon = verdict?.Icon;
+  const safetyTier = result !== null ? safetyScoreTier(result.score) : null;
 
   return (
     <div className="mx-auto flex max-w-5xl flex-col gap-10 px-4 py-12 sm:px-6 lg:px-8">
@@ -276,7 +325,7 @@ export function ScannerApp() {
         </section>
       )}
 
-      {result && verdict && VerdictIcon && (
+      {result && verdict && VerdictIcon && safetyTier && (
         <div className="space-y-8">
           <section className="grid gap-4 md:grid-cols-[1.2fr_minmax(0,1fr)]">
             <Card className="border-border/80">
@@ -289,11 +338,31 @@ export function ScannerApp() {
                     <VerdictIcon className="h-8 w-8" aria-hidden />
                     <span className="text-2xl font-semibold">{verdict.label}</span>
                     <span
-                      className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${verdict.className}`}
+                      className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-semibold tabular-nums ${safetyTier.badgeClassName}`}
+                      title={`Safety score: ${result.score}/100 (${safetyTier.label}). 100 = best, 0 = worst.`}
                     >
-                      Score {result.score}/100
+                      {result.score}/100 · {safetyTier.label}
                     </span>
                   </div>
+                  <p className="text-xs font-medium text-foreground">
+                    <span className="text-verdict-clean">100</span>
+                    <span className="text-muted-foreground font-normal">
+                      {" "}
+                      = best (cleaner page) ·{" "}
+                    </span>
+                    <span className="text-verdict-infected">0</span>
+                    <span className="text-muted-foreground font-normal">
+                      {" "}
+                      = worst (more red flags)
+                    </span>
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    {safetyTier.hint}{" "}
+                    <span className="text-foreground font-medium">Heuristic signal strength:</span>{" "}
+                    {CONFIDENCE_LABEL[result.detectionConfidence]}
+                    {" — "}
+                    higher means the match is stronger, not “more malware.”
+                  </p>
                   <p className="break-all text-sm text-muted-foreground">
                     <span className="font-medium text-foreground">Requested:</span>{" "}
                     {result.url}
