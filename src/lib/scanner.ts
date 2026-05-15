@@ -194,6 +194,63 @@ function hostnameOf(href: string, base: URL): string | null {
   }
 }
 
+/**
+ * Google IMA / AdSense / GAM, major social widgets, Bing UET, etc. often use
+ * hidden or 1×1 iframes — not parasite indicators.
+ */
+function isBenignAdOrSocialIframeHost(hostname: string): boolean {
+  const h = hostname.replace(/\.$/, "").toLowerCase();
+  if (!h) return false;
+
+  const exact = new Set([
+    "imasdk.googleapis.com",
+    "tpc.googlesyndication.com",
+    "pagead2.googlesyndication.com",
+    "www.googletagmanager.com",
+    "www.google.com",
+    "www.youtube.com",
+    "www.youtube-nocookie.com",
+    "player.vimeo.com",
+    "platform.twitter.com",
+    "syndication.twitter.com",
+    "cdn.syndication.twimg.com",
+    "connect.facebook.net",
+    "www.facebook.com",
+    "staticxx.facebook.com",
+    "bat.bing.com",
+    "www.reddit.com",
+    "www.redditmedia.com",
+    "accounts.google.com",
+    "fundingchoicesmessages.google.com",
+  ]);
+  if (exact.has(h)) return true;
+
+  const suffixOk = [
+    "doubleclick.net",
+    "googleadservices.com",
+    "googlesyndication.com",
+    "googletagservices.com",
+    "2mdn.net",
+    "bing.com",
+    "facebook.com",
+    "fbcdn.net",
+    "twimg.com",
+    "linkedin.com",
+    "licdn.com",
+    "instagram.com",
+    "tiktok.com",
+    "youtube.com",
+    "snapchat.com",
+    "amazon-adsystem.com",
+    "ads-twitter.com",
+  ];
+  for (const s of suffixOk) {
+    if (h === s || h.endsWith(`.${s}`)) return true;
+  }
+
+  return false;
+}
+
 /** Minified vendor widgets (Sucuri, Jetpack, WP emoji, etc.) trip crude regexes — skip those scripts. */
 function isLikelyBenignWidgetScript(inline: string): boolean {
   const s = inline.slice(0, 4000).toLowerCase();
@@ -518,6 +575,8 @@ export function analyzeHtml(
   $("iframe[src],iframe[data-src]").each((_, el) => {
     const $i = $(el);
     const src = $i.attr("src") || $i.attr("data-src") || "";
+    const ih = hostnameOf(src, base);
+    const benignEmbed = ih !== null && isBenignAdOrSocialIframeHost(ih);
     const w = parseFloat($i.attr("width") || "600") || 0;
     const h = parseFloat($i.attr("height") || "400") || 0;
     const st = parseStyle($i.attr("style"));
@@ -528,7 +587,7 @@ export function analyzeHtml(
       st.opacity === "0" ||
       st.display === "none";
 
-    if (tiny || st.visibility === "hidden") {
+    if ((tiny || st.visibility === "hidden") && !benignEmbed) {
       rows.push({
         category: "iframes",
         internal: "high",
@@ -540,8 +599,13 @@ export function analyzeHtml(
       });
     }
 
-    const ih = hostnameOf(src, base);
-    if (ih && ih !== base.hostname.replace(/^www\./, "")) {
+    const pageIframe = base.hostname.replace(/^www\./, "");
+    if (
+      ih &&
+      ih.replace(/^www\./, "") !== pageIframe &&
+      !ih.endsWith(`.${pageIframe}`) &&
+      !benignEmbed
+    ) {
       rows.push({
         category: "resources",
         internal: "medium",
