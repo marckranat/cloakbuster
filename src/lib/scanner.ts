@@ -135,12 +135,19 @@ function finalizeFindings(rows: InternalRow[]): ScanFinding[] {
     const severity: Severity | null =
       r.internal === "high" ? "medium" : r.internal === "medium" ? "low" : null;
     if (!severity) continue;
-    const { internal: _i, ...base } = r;
-    const key = `${base.category}|${base.title}|${base.evidence.slice(0, 160)}`;
+    const key = `${r.category}|${r.title}|${r.evidence.slice(0, 160)}`;
     if (seen.has(key)) continue;
     seen.add(key);
     seq += 1;
-    out.push({ ...base, id: `f-${seq}`, severity });
+    out.push({
+      id: `f-${seq}`,
+      severity,
+      category: r.category,
+      title: r.title,
+      description: r.description,
+      remediation: r.remediation,
+      evidence: r.evidence,
+    });
   }
   return out;
 }
