@@ -10,6 +10,43 @@ import type {
 const SPAM_KEYWORD_RE =
   /\b(viagra|cialis|tramadol|xanax|casino|poker|porn|xxx|pharmacy|replica\s*watch|seo\s*service|backlink|click\s*here\s*to\s*win)\b/i;
 
+/** Multi-word / brand strings common in parasite & gambling SEO injections (footer spam). Tiered to limit false positives. */
+const GAMBLING_SEO_SPAM_HIGH_CONFIDENCE = [
+  "slot thailand",
+  "toto 4d",
+  "toto 4 d",
+  "toto4d",
+  "pandawa4d",
+  "pandawa 4d",
+  "saldoku777",
+  "saldoku 777",
+  "deneme bonusu veren siteler",
+];
+
+/** Shorter tokens: only count if link is off-site or hidden (reduces random word hits). */
+const GAMBLING_SEO_SPAM_CONTEXT_ONLY = ["gamdom"];
+
+function normalizeAnchorText(t: string): string {
+  return t.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function gamblingSeoSpamAnchorLevel(
+  text: string,
+  ctx: { offSite: boolean; visuallyHidden: boolean },
+): "high" | "context" | null {
+  const n = normalizeAnchorText(text);
+  if (!n) return null;
+  for (const p of GAMBLING_SEO_SPAM_HIGH_CONFIDENCE) {
+    if (n.includes(p)) return "high";
+  }
+  if (ctx.offSite || ctx.visuallyHidden) {
+    for (const p of GAMBLING_SEO_SPAM_CONTEXT_ONLY) {
+      if (n.includes(p)) return "context";
+    }
+  }
+  return null;
+}
+
 const SUSPICIOUS_HOST_SUBSTR = [
   ".tk",
   ".ml",
@@ -359,6 +396,29 @@ export function analyzeHtml(
         description: "Hidden or aria-hidden link/URL matches spam/pharma-style vocabulary.",
         remediation: "Treat as compromise indicator — scan filesystem & DB, rotate creds.",
         evidence: truncate(`${text} | ${href}`),
+      });
+    }
+
+    const offSite = !!(
+      h &&
+      h !== pageH &&
+      !h.endsWith(`.${pageH}`)
+    );
+    const visuallyHidden = selfHidden || ariaHidden || hidden;
+    const spamLevel = gamblingSeoSpamAnchorLevel(text, {
+      offSite,
+      visuallyHidden,
+    });
+    if (spamLevel) {
+      rows.push({
+        category: "malware_patterns",
+        internal: spamLevel === "high" ? "high" : "medium",
+        title: "Gambling / SEO spam injection (link text)",
+        description:
+          "Anchor text matches phrases commonly injected in hacked footers and parasite pages (often paired with unrelated destinations).",
+        remediation:
+          "Search theme, plugins, database options, and server files for this HTML; rotate CMS credentials; review recent admin logins.",
+        evidence: truncate(`text="${text}" href=${href} ${$.html(el)}`),
       });
     }
   });

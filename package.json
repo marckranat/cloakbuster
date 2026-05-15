@@ -16,7 +16,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "playwright:install": "npx playwright install chromium"
+    "playwright:install": "npx playwright install chromium",
+    "playwright:install:deps": "npx playwright install-deps chromium"
   },
   "dependencies": {
     "cheerio": "^1.0.0",

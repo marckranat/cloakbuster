@@ -123,10 +123,19 @@ cd cloakbuster
 
 ```bash
 npm ci
-npm run playwright:install
+# Ubuntu/Debian server: install OS libraries for headless Chromium (avoids
+# "error while loading shared libraries: libatk-1.0.so.0" and similar).
+sudo npx playwright install-deps chromium
+npx playwright install chromium
 ```
 
-`playwright:install` runs `npx playwright install chromium` and downloads Chromium into the project (needs a few hundred MB).
+On **macOS** or local dev you can usually skip `install-deps` and run only:
+
+```bash
+npx playwright install chromium
+```
+
+Or use `npm run playwright:install` (browser only; no system packages).
 
 ### 8. Build
 
@@ -303,7 +312,8 @@ sudo systemctl reload nginx   # usually unnecessary if plugin ran renew
 cd ~/cloakbuster
 git pull
 npm ci
-npm run playwright:install   # when Playwright version changes
+sudo npx playwright install-deps chromium   # when Playwright/Chromium version changes on Linux
+npx playwright install chromium
 npm run build
 sudo systemctl restart cloakbuster
 ```
