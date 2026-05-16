@@ -1,4 +1,5 @@
 import * as cheerio from "cheerio";
+import type { AnyNode } from "domhandler";
 import type {
   DetectionConfidence,
   ScanFinding,
@@ -222,6 +223,15 @@ function isBenignAdOrSocialIframeHost(hostname: string): boolean {
     "www.redditmedia.com",
     "accounts.google.com",
     "fundingchoicesmessages.google.com",
+    "app.mailerlite.com",
+    "trc.taboola.com",
+    "cdn.taboola.com",
+    "widgets.taboola.com",
+    "gum.criteo.com",
+    "bidder.criteo.com",
+    "dynamic.criteo.com",
+    "hbopenbid.pubmatic.com",
+    "sshowads.pubmatic.com",
   ]);
   if (exact.has(h)) return true;
 
@@ -243,12 +253,68 @@ function isBenignAdOrSocialIframeHost(hostname: string): boolean {
     "snapchat.com",
     "amazon-adsystem.com",
     "ads-twitter.com",
+    "taboola.com",
+    "criteo.com",
+    "pubmatic.com",
   ];
   for (const s of suffixOk) {
     if (h === s || h.endsWith(`.${s}`)) return true;
   }
 
   return false;
+}
+
+function isSameSiteHostname(linkHost: string | null, pageHostNoWww: string): boolean {
+  if (linkHost === null) return true;
+  const h = linkHost.replace(/^www\./, "");
+  const p = pageHostNoWww.replace(/^www\./, "");
+  return h === p || h.endsWith(`.${p}`);
+}
+
+/** WordPress / themes: featured-image links use aria-hidden + decorative classes so AT skips duplicate text. */
+function isLikelyWpDecorativeImageLink(
+  $a: cheerio.Cheerio<AnyNode>,
+  href: string,
+  base: URL,
+  pageH: string,
+): boolean {
+  const h = hostnameOf(href, base);
+  if (!isSameSiteHostname(h, pageH)) return false;
+  if ($a.find("img").length === 0) return false;
+  const aHidden = $a.attr("aria-hidden") === "true";
+  const tab = $a.attr("tabindex");
+  if (!aHidden && tab !== "-1") return false;
+  const cls = ($a.attr("class") || "").toLowerCase();
+  return (
+    /\balignnone\b/.test(cls) ||
+    /\bentry-image\b/.test(cls) ||
+    /\battachment-post\b/.test(cls) ||
+    /\bwp-post-image\b/.test(cls) ||
+    /\bpost-thumbnail\b/.test(cls) ||
+    /\bwp-block-post-featured-image\b/.test(cls)
+  );
+}
+
+function isBenignNoOpJavascriptHref(href: string): boolean {
+  const t = href.trim();
+  return /^javascript:\s*void\s*\(\s*0\s*\)\s*;?\s*$/i.test(t);
+}
+
+/** Pojo / UserWay / accessiBe etc. use javascript:void(0) on toolbar toggles. */
+function isLikelyAccessibilityToolbarLink($a: cheerio.Cheerio<AnyNode>): boolean {
+  const cls = ($a.attr("class") || "").toLowerCase();
+  const title = ($a.attr("title") || "").toLowerCase();
+  const id = ($a.attr("id") || "").toLowerCase();
+  return (
+    cls.includes("pojo-a11y") ||
+    cls.includes("userway") ||
+    cls.includes("accessibe") ||
+    cls.includes("acsb") ||
+    cls.includes("equalweb") ||
+    cls.includes("asw-menu") ||
+    id.includes("accessibility") ||
+    title.includes("accessibility")
+  );
 }
 
 /** Minified vendor widgets (Sucuri, Jetpack, WP emoji, etc.) trip crude regexes — skip those scripts. */
@@ -464,6 +530,7 @@ export function analyzeHtml(
   $("a[href]").each((_, el) => {
     const $a = $(el);
     const href = $a.attr("href") || "";
+    const pageH = base.hostname.replace(/^www\./, "");
     const text = $a.text().replace(/\s+/g, " ").trim();
 
     const titleAttr = ($a.attr("title") || "").replace(/\s+/g, " ").trim();
@@ -475,19 +542,24 @@ export function analyzeHtml(
     const ariaHidden = $a.attr("aria-hidden") === "true";
 
     if (selfHidden || ariaHidden) {
-      rows.push({
-        category: "hidden_links",
-        internal: href.startsWith("http") ? "high" : "medium",
-        title: "Hidden or suppressed link",
-        description:
-          "Link is styled or marked in a way that often hides it from visitors while keeping it in the DOM.",
-        remediation:
-          "Audit theme/plugins; remove unknown links; search codebase for injected HTML.",
-        evidence: truncate(`href=${href} text="${text}" ${$.html(el)}`),
-      });
+      if (!isLikelyWpDecorativeImageLink($a, href, base, pageH)) {
+        rows.push({
+          category: "hidden_links",
+          internal: href.startsWith("http") ? "high" : "medium",
+          title: "Hidden or suppressed link",
+          description:
+            "Link is styled or marked in a way that often hides it from visitors while keeping it in the DOM.",
+          remediation:
+            "Audit theme/plugins; remove unknown links; search codebase for injected HTML.",
+          evidence: truncate(`href=${href} text="${text}" ${$.html(el)}`),
+        });
+      }
     }
 
-    if (/^javascript:/i.test(href)) {
+    if (
+      /^javascript:/i.test(href) &&
+      !(isBenignNoOpJavascriptHref(href) && isLikelyAccessibilityToolbarLink($a))
+    ) {
       rows.push({
         category: "scripts",
         internal: "high",
@@ -500,7 +572,6 @@ export function analyzeHtml(
     }
 
     const h = hostnameOf(href, base);
-    const pageH = base.hostname.replace(/^www\./, "");
     if (h && h !== pageH && !h.endsWith(`.${pageH}`)) {
       const generic =
         !text ||
