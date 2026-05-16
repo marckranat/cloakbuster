@@ -1,5 +1,6 @@
 import * as cheerio from "cheerio";
 import type { AnyNode } from "domhandler";
+import { isBenignThirdPartyIframeHost } from "./benign-embed-allowlist";
 import type {
   DetectionConfidence,
   ScanFinding,
@@ -193,75 +194,6 @@ function hostnameOf(href: string, base: URL): string | null {
   } catch {
     return null;
   }
-}
-
-/**
- * Google IMA / AdSense / GAM, major social widgets, Bing UET, etc. often use
- * hidden or 1×1 iframes — not parasite indicators.
- */
-function isBenignAdOrSocialIframeHost(hostname: string): boolean {
-  const h = hostname.replace(/\.$/, "").toLowerCase();
-  if (!h) return false;
-
-  const exact = new Set([
-    "imasdk.googleapis.com",
-    "tpc.googlesyndication.com",
-    "pagead2.googlesyndication.com",
-    "www.googletagmanager.com",
-    "www.google.com",
-    "www.youtube.com",
-    "www.youtube-nocookie.com",
-    "player.vimeo.com",
-    "platform.twitter.com",
-    "syndication.twitter.com",
-    "cdn.syndication.twimg.com",
-    "connect.facebook.net",
-    "www.facebook.com",
-    "staticxx.facebook.com",
-    "bat.bing.com",
-    "www.reddit.com",
-    "www.redditmedia.com",
-    "accounts.google.com",
-    "fundingchoicesmessages.google.com",
-    "app.mailerlite.com",
-    "trc.taboola.com",
-    "cdn.taboola.com",
-    "widgets.taboola.com",
-    "gum.criteo.com",
-    "bidder.criteo.com",
-    "dynamic.criteo.com",
-    "hbopenbid.pubmatic.com",
-    "sshowads.pubmatic.com",
-  ]);
-  if (exact.has(h)) return true;
-
-  const suffixOk = [
-    "doubleclick.net",
-    "googleadservices.com",
-    "googlesyndication.com",
-    "googletagservices.com",
-    "2mdn.net",
-    "bing.com",
-    "facebook.com",
-    "fbcdn.net",
-    "twimg.com",
-    "linkedin.com",
-    "licdn.com",
-    "instagram.com",
-    "tiktok.com",
-    "youtube.com",
-    "snapchat.com",
-    "amazon-adsystem.com",
-    "ads-twitter.com",
-    "taboola.com",
-    "criteo.com",
-    "pubmatic.com",
-  ];
-  for (const s of suffixOk) {
-    if (h === s || h.endsWith(`.${s}`)) return true;
-  }
-
-  return false;
 }
 
 function isSameSiteHostname(linkHost: string | null, pageHostNoWww: string): boolean {
@@ -647,7 +579,7 @@ export function analyzeHtml(
     const $i = $(el);
     const src = $i.attr("src") || $i.attr("data-src") || "";
     const ih = hostnameOf(src, base);
-    const benignEmbed = ih !== null && isBenignAdOrSocialIframeHost(ih);
+    const benignEmbed = ih !== null && isBenignThirdPartyIframeHost(ih);
     const w = parseFloat($i.attr("width") || "600") || 0;
     const h = parseFloat($i.attr("height") || "400") || 0;
     const st = parseStyle($i.attr("style"));
@@ -671,20 +603,34 @@ export function analyzeHtml(
     }
 
     const pageIframe = base.hostname.replace(/^www\./, "");
-    if (
-      ih &&
+    const crossOrigin =
+      !!ih &&
       ih.replace(/^www\./, "") !== pageIframe &&
-      !ih.endsWith(`.${pageIframe}`) &&
-      !benignEmbed
-    ) {
-      rows.push({
-        category: "resources",
-        internal: "medium",
-        title: "Cross-origin iframe",
-        description: "Loads third-party content in an iframe — verify it is authorized.",
-        remediation: "Check CSP, remove unknown embeds, review recent theme/plugin changes.",
-        evidence: truncate(src),
-      });
+      !ih.endsWith(`.${pageIframe}`);
+    if (crossOrigin) {
+      if (benignEmbed) {
+        rows.push({
+          category: "resources",
+          internal: "medium",
+          title: "Third-party iframe (recognized vendor)",
+          description:
+            "This iframe matches a common ad, social, or CMS embed (for example Jetpack, Mailchimp, AddToAny, reCAPTCHA/Turnstile, or newsletter widgets). Low heuristic concern — still confirm it is intentional and tighten Content-Security-Policy so only expected origins can frame content.",
+          remediation:
+            "Hardening: define an explicit CSP frame-src (or default-src fallback) that lists only vendors you use; remove stale frame allowances when you uninstall plugins.",
+          evidence: truncate(src),
+        });
+      } else {
+        rows.push({
+          category: "resources",
+          internal: "medium",
+          title: "Cross-origin iframe",
+          description:
+            "Loads third-party content in an iframe. If you did not add this embed, investigate; if you did, lock it down with Content-Security-Policy.",
+          remediation:
+            "Check Content-Security-Policy (frame-src, default-src) so only authorized origins can be framed; remove unknown embeds; review recent theme/plugin changes.",
+          evidence: truncate(src),
+        });
+      }
     }
   });
 
