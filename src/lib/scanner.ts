@@ -11,7 +11,20 @@ import type {
 } from "./types";
 
 const SPAM_KEYWORD_RE =
-  /\b(viagra|cialis|tramadol|xanax|casino|poker|porn|xxx|pharmacy|replica\s*watch|seo\s*service|backlink|click\s*here\s*to\s*win)\b/i;
+  /\b(viagra|cialis|tramadol|xanax|casino|poker|porn|xxx|pharmacy|replica\s*watch|seo\s*service|backlink|click\s*here\s*to\s*win|cash)\b/i;
+
+/**
+ * Leetspeak / obfuscated adult-spam strings (injected footer links).
+ * Subset adapted from mogade/badwords en.txt — we do **not** import slurs or general
+ * profanity (wrong product; huge FP risk on news, advocacy, medical sites).
+ * @see https://github.com/mogade/badwords/blob/master/en.txt
+ */
+const SPAM_ADULT_LEET_RE =
+  /\b(?:p[o0]rn(?:[o0](?:gr[a@]phy|[s$]?))?|mast(?:e|ur)b(?:8|ait|ate))\b/i;
+
+/** Typos / brand strings in parasite gambling anchors — match off-site in parasiteAnchorPhraseLevel. */
+const GAMBLING_TYPO_ANCHOR_RE =
+  /\b(cassino|c[a@]ssino|play\s+fortuna|fortuna\s+play|on\s*line\s+cassino)\b/i;
 
 /** Multi-word / brand strings common in parasite & gambling SEO injections (footer spam). Tiered to limit false positives. */
 const GAMBLING_SEO_SPAM_HIGH_CONFIDENCE = [
@@ -79,12 +92,90 @@ function normalizeAnchorText(t: string): string {
   return t.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+/** Letters only (Latin extended, Cyrillic blocks, Greek) for script mixing heuristics. */
+function letterOnlyCore(s: string): string {
+  let out = "";
+  for (const ch of s) {
+    const c = ch.codePointAt(0)!;
+    if (
+      (c >= 0x41 && c <= 0x5a) ||
+      (c >= 0x61 && c <= 0x7a) ||
+      (c >= 0xc0 && c <= 0x24f) ||
+      (c >= 0x1e00 && c <= 0x1eff) ||
+      (c >= 0x400 && c <= 0x52f) ||
+      (c >= 0xa640 && c <= 0xa69f) ||
+      (c >= 0x391 && c <= 0x3a9) ||
+      (c >= 0x3b1 && c <= 0x3ce)
+    ) {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+function scriptKindOfToken(token: string): "empty" | "latin" | "cyrillic" | "greek" | "mixed" | "other" {
+  const core = letterOnlyCore(token);
+  if (core.length < 2) return "empty";
+  const hasLat = /[A-Za-z\u00C0-\u024F\u1E00-\u1EFF]/.test(core);
+  const hasCyr = /[\u0400-\u04FF\u0500-\u052F\uA640-\uA69F]/.test(core);
+  const hasGk = /[\u0391-\u03A9\u03B1-\u03CE]/.test(core);
+  const nScripts = (hasLat ? 1 : 0) + (hasCyr ? 1 : 0) + (hasGk ? 1 : 0);
+  if (nScripts >= 2) return "mixed";
+  if (hasLat) return "latin";
+  if (hasCyr) return "cyrillic";
+  if (hasGk) return "greek";
+  return "other";
+}
+
+/**
+ * Latin anchor text with an isolated Cyrillic/Greek word, or Cyrillic letters mixed
+ * inside a Latin-looking token (homographs). Common in parasite / IDN tricks.
+ */
+function mixedScriptInjectionSignal(text: string): "homograph" | "interword" | null {
+  const raw = text.normalize("NFKC").trim();
+  if (!raw) return null;
+  const tokens = raw.split(/[\s/|<>]+/).filter(Boolean);
+  for (const tok of tokens) {
+    if (scriptKindOfToken(tok) === "mixed" && letterOnlyCore(tok).length >= 3) {
+      return "homograph";
+    }
+  }
+  if (tokens.length < 2) return null;
+  const kinds = new Set(tokens.map((t) => scriptKindOfToken(t)));
+  if (kinds.has("latin") && (kinds.has("cyrillic") || kinds.has("greek"))) {
+    return "interword";
+  }
+  return null;
+}
+
+/** “Escape this site” / safety quick-leave links often point at Google — not parasite. */
+function isLikelySafetyExitLink(href: string, text: string, base: URL): boolean {
+  const t = normalizeAnchorText(text);
+  if (!/\bescape\b/.test(t)) return false;
+  if (!/\b(site|page)\b/.test(t)) return false;
+  const h = hostnameOf(href, base);
+  return h === "www.google.com" || h === "google.com";
+}
+
 function parasiteAnchorPhraseLevel(
   textJoined: string,
   ctx: { offSite: boolean; visuallyHidden: boolean },
 ): "high" | "context" | null {
   const n = normalizeAnchorText(textJoined);
   if (!n) return null;
+
+  if (ctx.offSite && GAMBLING_TYPO_ANCHOR_RE.test(n)) return "high";
+
+  if (
+    ctx.offSite &&
+    !ctx.visuallyHidden &&
+    n.length <= 40 &&
+    /\b(cash|casino|poker|porn)\b/i.test(n)
+  ) {
+    return "high";
+  }
+
+  if ((ctx.offSite || ctx.visuallyHidden) && SPAM_ADULT_LEET_RE.test(n)) return "high";
 
   for (const p of GAMBLING_SEO_SPAM_HIGH_CONFIDENCE) {
     if (n.includes(p)) return "high";
@@ -162,30 +253,19 @@ function isHiddenByStyles(styles: Record<string, string>): boolean {
   return false;
 }
 
-function collectAncestorStyles($: cheerio.CheerioAPI, el: unknown): {
-  combined: Record<string, string>;
-  hidden: boolean;
-} {
-  const chain: unknown[] = [];
-  let cur: unknown = el;
-  while (cur) {
-    chain.push(cur);
-    const parent = $(cur as never).parent()[0];
-    cur = parent;
-    if (chain.length > 25) break;
+/** True when a **parent** (not the element itself) uses hidden styles — common for Divi/Elementor responsive menus. */
+function isAncestorChainVisuallyHidden($: cheerio.CheerioAPI, el: unknown): boolean {
+  let cur = $(el as never).parent()[0];
+  let depth = 0;
+  while (cur && depth < 25) {
+    const $node = $(cur as never);
+    if ($node.attr("hidden") !== undefined) return true;
+    const st = parseStyle($node.attr("style"));
+    if (isHiddenByStyles(st)) return true;
+    cur = $(cur as never).parent()[0];
+    depth++;
   }
-  const combined: Record<string, string> = {};
-  let hidden = false;
-  for (const node of chain) {
-    const $node = $(node as never);
-    const st = $node.attr("style");
-    const parsed = parseStyle(st);
-    Object.assign(combined, parsed);
-    if ($node.attr("hidden") !== undefined) hidden = true;
-    if (isHiddenByStyles(parsed)) hidden = true;
-  }
-  if (isHiddenByStyles(combined)) hidden = true;
-  return { combined, hidden };
+  return false;
 }
 
 function hostnameOf(href: string, base: URL): string | null {
@@ -337,8 +417,17 @@ function scoreFromFindings(findings: ScanFinding[]): {
   penalty = Math.min(MAX_SAFETY_PENALTY, penalty);
   const score = Math.max(0, 100 - penalty);
 
+  const hasDecisiveMalwareFinding = findings.some(
+    (f) =>
+      f.category === "malware_patterns" &&
+      f.severity === "medium" &&
+      (f.title === "Parasite spam (anchor / title text)" ||
+        f.title === "Spam keywords in hidden context" ||
+        f.title.startsWith("Mixed-script")),
+  );
+
   let verdict: Verdict = "clean";
-  if (totalMedium >= 2 || score < 42) verdict = "infected";
+  if (totalMedium >= 2 || score < 42 || hasDecisiveMalwareFinding) verdict = "infected";
   else if (findings.length > 0 || score < 80) verdict = "warning";
 
   const malwareCount = findings.filter((f) => f.category === "malware_patterns").length;
@@ -468,23 +557,45 @@ export function analyzeHtml(
     const titleAttr = ($a.attr("title") || "").replace(/\s+/g, " ").trim();
     const linkLabel = [text, titleAttr].filter(Boolean).join(" ");
 
-    const { hidden } = collectAncestorStyles($, el);
+    const ancestorHidden = isAncestorChainVisuallyHidden($, el);
     const selfStyles = parseStyle($a.attr("style"));
-    const selfHidden = isHiddenByStyles(selfStyles) || hidden;
+    const selfVisualHidden = isHiddenByStyles(selfStyles);
     const ariaHidden = $a.attr("aria-hidden") === "true";
+    const obscured = ancestorHidden || selfVisualHidden || ariaHidden;
 
-    if (selfHidden || ariaHidden) {
-      if (!isLikelyWpDecorativeImageLink($a, href, base, pageH)) {
-        rows.push({
-          category: "hidden_links",
-          internal: href.startsWith("http") ? "high" : "medium",
-          title: "Hidden or suppressed link",
-          description:
-            "Link is styled or marked in a way that often hides it from visitors while keeping it in the DOM.",
-          remediation:
-            "Audit theme/plugins; remove unknown links; search codebase for injected HTML.",
-          evidence: truncate(`href=${href} text="${text}" ${$.html(el)}`),
-        });
+    const h = hostnameOf(href, base);
+    const sameSiteLink = isSameSiteHostname(h, pageH);
+
+    if (!isLikelyWpDecorativeImageLink($a, href, base, pageH)) {
+      if (ariaHidden || selfVisualHidden) {
+        if (!isLikelySafetyExitLink(href, text, base)) {
+          rows.push({
+            category: "hidden_links",
+            internal: sameSiteLink ? "medium" : "high",
+            title: "Hidden or suppressed link",
+            description:
+              "The anchor itself is aria-hidden or has invisible/off-screen styles. Themes do this for controls; attackers hide parasite links the same way.",
+            remediation:
+              "If the label/host is unfamiliar, search the theme and database for injections; otherwise it may be intentional UI.",
+            evidence: truncate(`href=${href} text="${text}" ${$.html(el)}`),
+          });
+        }
+      } else if (ancestorHidden) {
+        const t = normalizeAnchorText(text);
+        const imageOnlySameSite =
+          sameSiteLink && $a.find("img").length > 0 && t.length === 0;
+        if (!imageOnlySameSite && (!sameSiteLink || t.length < 2)) {
+          rows.push({
+            category: "hidden_links",
+            internal: sameSiteLink ? "medium" : "high",
+            title: "Hidden or suppressed link",
+            description:
+              "Link lives inside a hidden container (e.g. collapsed responsive menu) and points off-site or has almost no text — a pattern both themes and injections use.",
+            remediation:
+              "Treat off-site / empty-label cases first; many same-site menu links in display:none panels are normal builder markup.",
+            evidence: truncate(`href=${href} text="${text}" ${$.html(el)}`),
+          });
+        }
       }
     }
 
@@ -503,7 +614,6 @@ export function analyzeHtml(
       });
     }
 
-    const h = hostnameOf(href, base);
     if (h && h !== pageH && !h.endsWith(`.${pageH}`)) {
       const generic =
         !text ||
@@ -513,7 +623,7 @@ export function analyzeHtml(
         const hasMedia = $a.find("img, svg, picture, video").length > 0;
         const label = (($a.attr("aria-label") || "") + ($a.attr("title") || "")).trim();
         const suspiciousHost = SUSPICIOUS_HOST_SUBSTR.some((frag) => h.includes(frag));
-        if (!hasMedia && label.length < 3 && (hidden || suspiciousHost)) {
+        if (!hasMedia && label.length < 3 && (obscured || suspiciousHost)) {
           rows.push({
             category: "cloaked_links",
             internal: "medium",
@@ -544,7 +654,7 @@ export function analyzeHtml(
       }
     }
 
-    if (SPAM_KEYWORD_RE.test(`${linkLabel} ${href}`) && (selfHidden || ariaHidden)) {
+    if (SPAM_KEYWORD_RE.test(`${linkLabel} ${href}`) && obscured) {
       rows.push({
         category: "malware_patterns",
         internal: "high",
@@ -556,7 +666,33 @@ export function analyzeHtml(
     }
 
     const offSite = !!(h && h !== pageH && !h.endsWith(`.${pageH}`));
-    const visuallyHidden = selfHidden || ariaHidden || hidden;
+    const visuallyHidden = obscured;
+
+    const mix = mixedScriptInjectionSignal(linkLabel);
+    if (mix === "homograph") {
+      rows.push({
+        category: "malware_patterns",
+        internal: "high",
+        title: "Mixed-script token (possible homograph)",
+        description:
+          "A single word mixes Latin letters with Cyrillic or Greek look-alikes — often used to evade naive filters while looking like a normal English brand.",
+        remediation:
+          "Inspect the raw Unicode of this label and the destination URL; compare with a known-good backup.",
+        evidence: truncate(`label="${linkLabel}" href=${href} ${$.html(el)}`),
+      });
+    } else if (mix === "interword" && (offSite || obscured)) {
+      rows.push({
+        category: "malware_patterns",
+        internal: "high",
+        title: "Mixed-script label (Latin + Cyrillic/Greek)",
+        description:
+          "Anchor text combines Latin words with a separate Cyrillic or Greek word — common in spam injections on otherwise English sites.",
+        remediation:
+          "Verify the link is intentional; search templates and DB widgets for unauthorized HTML.",
+        evidence: truncate(`label="${linkLabel}" href=${href} ${$.html(el)}`),
+      });
+    }
+
     const spamLevel = parasiteAnchorPhraseLevel(linkLabel, {
       offSite,
       visuallyHidden,

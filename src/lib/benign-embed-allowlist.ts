@@ -49,6 +49,10 @@ const EXACT_HOSTS = new Set([
   "sshowads.pubmatic.com",
   /** Cloudflare Turnstile (often paired with Contact Form 7) */
   "challenges.cloudflare.com",
+  /** Stripe.js / Elements / Checkout embeds */
+  "js.stripe.com",
+  "m.stripe.com",
+  "hooks.stripe.com",
 ]);
 
 const SUFFIX_HOSTS = [
@@ -90,6 +94,8 @@ const SUFFIX_HOSTS = [
   "recaptcha.net",
   /** hCaptcha (common Contact Form 7 add-on / integration) */
   "hcaptcha.com",
+  /** Stripe (payments, donations) */
+  "stripe.com",
 ] as const;
 
 export function isBenignThirdPartyIframeHost(hostname: string): boolean {
